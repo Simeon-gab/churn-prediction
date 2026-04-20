@@ -13,6 +13,7 @@ data/raw/*.csv
 data/processed/*.csv
 data/models/*.pkl
 data/models/*.json
+data/*.db
 
 # But keep the folders themselves in git
 !data/raw/.gitkeep

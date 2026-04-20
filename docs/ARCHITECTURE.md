@@ -72,9 +72,13 @@ not an afterthought.
 ┌──────────────────────────────────────────────────────────────────┐
 │                 PREDICTIONS STORE (Step 3)                       │
 │                                                                  │
-│   Postgres table: churn_predictions                              │
-│   (account_id, subscription_id, churn_probability, risk_level,   │
-│    scored_at, top_factors)                                       │
+│   Table: churn_predictions                                       │
+│   (subscription_id, account_id, churn_probability, risk_level,   │
+│    scored_at, scored_date, top_factors)                          │
+│                                                                  │
+│   Portfolio default: SQLite at data/churn.db                     │
+│   Production swap: set DATABASE_URL env var to a Postgres DSN.  │
+│   All writer/reader code uses SQLAlchemy — DB type is invisible. │
 │                                                                  │
 │   Acts as the single source of truth. Every downstream system   │
 │   reads from here, never from the model directly.               │
@@ -107,8 +111,10 @@ Walkthrough for one account, end to end:
 7. **3:00:10** — `risk_level()` maps each probability to Low/Medium/High/Critical.
 8. **3:00:11** — Results are concatenated with the meta frame
    (subscription_id, account_id, plan_tier, seats, tenure_days).
-9. **3:00:12** — DAG task `write_to_postgres` upserts into the
-   `churn_predictions` table (Step 3).
+9. **3:00:12** — DAG task `write_to_db` calls `write_predictions()`,
+   which upserts into `churn_predictions` (Step 3). One row per
+   account per day — re-running the scorer today overwrites that
+   account's row for today, it does not create a duplicate.
 10. **3:00:13** — DAG task `sync_to_crm` fires for high/critical only,
     updating Account records in HubSpot/Salesforce (Step 5).
 11. **7:00am** — CSMs open the dashboard. Dashboard API calls
@@ -157,10 +163,12 @@ cached the same way. Predictions are written to Postgres once per night
 and read thousands of times from there — no re-scoring on every dashboard
 page load.
 
-**Predictions are append-only.** Every night we write a fresh row per
-account with a `scored_at` timestamp. We never overwrite. This preserves
-score history for trend analysis ("why did this account go from 0.3 to
-0.7 in three weeks?").
+**Predictions are one row per account per day (append-only at the day
+level).** Every night we upsert one row per account keyed on
+`(subscription_id, scored_date)`. Running the scorer twice in the same
+day overwrites the earlier run for that account — it does not create
+duplicates. Score history accumulates across days, enabling trend
+analysis ("why did this account go from 0.3 to 0.7 in three weeks?").
 
 ## What's different from the "real" diagram in the research doc
 

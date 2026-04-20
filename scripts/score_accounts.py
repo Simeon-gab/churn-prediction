@@ -11,9 +11,16 @@ Run manually:
     cd churn_prediction
     python scripts/score_accounts.py
 
-Outputs two CSVs to data/processed/:
-    churn_risk_predictions.csv      — all customers, sorted by risk
-    high_medium_risk_customers.csv  — the CSM target list
+Outputs:
+    data/processed/churn_risk_predictions.csv      — all customers, sorted by risk
+    data/processed/high_medium_risk_customers.csv  — the CSM target list
+    data/churn.db (SQLite)                         — churn_predictions table (Step 3)
+
+The CSVs are debug artifacts and a fallback if the DB ever gets corrupted.
+The DB is the source of truth for all downstream consumers (dashboard, CRM sync).
+
+To use a different database, set the DATABASE_URL environment variable:
+    export DATABASE_URL="postgresql://user:pass@host:5432/dbname"
 """
 
 import sys
@@ -27,6 +34,8 @@ import pandas as pd
 from src.data.load_data import load_subscriptions, load_usage, load_tickets
 from src.features.build_features import build_features
 from src.models.predict_model import predict_churn_risk
+from src.data.db import get_engine
+from src.data.write_predictions import create_table_if_not_exists, write_predictions
 
 
 OUTPUT_DIR = Path("data/processed")
@@ -35,7 +44,7 @@ ACTION_LIST_PATH = OUTPUT_DIR / "high_medium_risk_customers.csv"
 
 
 def score_accounts() -> pd.DataFrame:
-    """Load, feature-engineer, score, segment, save."""
+    """Load, feature-engineer, score, segment, save to CSV and DB."""
 
     # --- Load ---
     print("Loading raw data...")
@@ -67,18 +76,27 @@ def score_accounts() -> pd.DataFrame:
     ]
     risk_table = risk_table[business_cols]
 
-    # --- Save full table ---
+    # --- Save full table (CSV — debug artifact + fallback) ---
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     risk_table.to_csv(FULL_PREDICTIONS_PATH, index=False)
     print(f"\nFull predictions saved: {FULL_PREDICTIONS_PATH}")
 
-    # --- CSM action list: Medium, High, Critical only ---
+    # --- CSM action list: Medium, High, Critical only (CSV) ---
     action_customers = risk_table[
         risk_table["risk_level"].isin(["Medium", "High", "Critical"])
     ].sort_values("churn_probability", ascending=False)
 
     action_customers.to_csv(ACTION_LIST_PATH, index=False)
     print(f"CSM action list saved:  {ACTION_LIST_PATH}")
+
+    # --- Write to DB (source of truth for downstream consumers) ---
+    # create_table_if_not_exists is idempotent — safe to call on every run.
+    # It's called here explicitly rather than on import so that importing
+    # write_predictions never triggers side effects.
+    engine = get_engine()
+    create_table_if_not_exists(engine)
+    rows_written = write_predictions(risk_table, engine)
+    print(f"Predictions written to DB: {rows_written} rows upserted")
 
     # --- Summary ---
     print("\nRisk tier breakdown:")
