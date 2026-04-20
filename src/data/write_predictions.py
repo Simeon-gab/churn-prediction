@@ -170,3 +170,59 @@ def write_predictions(risk_table: pd.DataFrame, engine: Engine) -> int:
         conn.execute(text(_UPSERT_SQL), rows)
 
     return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Top-factors updater (Step 4)
+# ---------------------------------------------------------------------------
+
+_UPDATE_TOP_FACTORS_SQL = """
+UPDATE churn_predictions
+SET top_factors = :top_factors
+WHERE subscription_id = :subscription_id
+  AND scored_date     = :scored_date
+"""
+
+
+def update_top_factors(
+    top_factors_map: dict[str, str],
+    engine: Engine,
+    scored_date: str,
+) -> int:
+    """Write precomputed SHAP top-factors into the top_factors column.
+
+    Called by score_accounts.py immediately after write_predictions(),
+    using the same scored_date so the UPDATE targets the rows just inserted.
+
+    Parameters
+    ----------
+    top_factors_map : dict[str, str]
+        Maps subscription_id -> JSON string (output of compute_top_factors()).
+    engine : Engine
+        Same engine used for write_predictions().
+    scored_date : str
+        YYYY-MM-DD string that matches the scored_date written by write_predictions().
+        Both functions derive this from UTC now(), so they agree when called in
+        the same process.
+
+    Returns
+    -------
+    int
+        Number of rows updated.
+    """
+    if not top_factors_map:
+        return 0
+
+    rows = [
+        {
+            "subscription_id": sub_id,
+            "scored_date":     scored_date,
+            "top_factors":     factors_json,
+        }
+        for sub_id, factors_json in top_factors_map.items()
+    ]
+
+    with engine.begin() as conn:
+        conn.execute(text(_UPDATE_TOP_FACTORS_SQL), rows)
+
+    return len(rows)

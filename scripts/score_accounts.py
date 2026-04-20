@@ -24,6 +24,7 @@ To use a different database, set the DATABASE_URL environment variable:
 """
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Make `src` importable when running this script directly
@@ -34,8 +35,13 @@ import pandas as pd
 from src.data.load_data import load_subscriptions, load_usage, load_tickets
 from src.features.build_features import build_features
 from src.models.predict_model import predict_churn_risk
+from src.models.explain_model import compute_top_factors
 from src.data.db import get_engine
-from src.data.write_predictions import create_table_if_not_exists, write_predictions
+from src.data.write_predictions import (
+    create_table_if_not_exists,
+    write_predictions,
+    update_top_factors,
+)
 
 
 OUTPUT_DIR = Path("data/processed")
@@ -44,7 +50,7 @@ ACTION_LIST_PATH = OUTPUT_DIR / "high_medium_risk_customers.csv"
 
 
 def score_accounts() -> pd.DataFrame:
-    """Load, feature-engineer, score, segment, save to CSV and DB."""
+    """Load, feature-engineer, score, explain, and persist to CSV and DB."""
 
     # --- Load ---
     print("Loading raw data...")
@@ -97,6 +103,17 @@ def score_accounts() -> pd.DataFrame:
     create_table_if_not_exists(engine)
     rows_written = write_predictions(risk_table, engine)
     print(f"Predictions written to DB: {rows_written} rows upserted")
+
+    # --- Precompute SHAP top factors for every account ---
+    # We have X_encoded in memory right now — this is the cheapest moment
+    # to run SHAP. The result is stored in top_factors so /explain is a
+    # fast DB read instead of reloading CSVs at request time.
+    # scored_date must match what write_predictions() used (same UTC date).
+    print("Computing SHAP explanations for all accounts...")
+    scored_date = datetime.now(timezone.utc).date().isoformat()
+    top_factors_map = compute_top_factors(X_encoded, meta)
+    rows_explained = update_top_factors(top_factors_map, engine, scored_date)
+    print(f"Top factors written to DB: {rows_explained} rows updated")
 
     # --- Summary ---
     print("\nRisk tier breakdown:")
