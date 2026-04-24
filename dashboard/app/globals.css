@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+@theme inline {
+  /* ── Backgrounds ───────────────────────────────────── */
+  --color-bg:            #0A0A0B;
+  --color-surface:       #141416;
+  --color-surface-hover: #1C1C1F;
+  --color-border:        #27272A;
+
+  /* ── Text ──────────────────────────────────────────── */
+  --color-text-primary:   #FAFAFA;
+  --color-text-secondary: #A1A1AA;
+  --color-text-tertiary:  #52525B;
+
+  /* ── Accent ────────────────────────────────────────── */
+  --color-accent: #00D87E;
+
+  /* ── Risk tiers ────────────────────────────────────── */
+  --color-risk-critical: #F43F5E;
+  --color-risk-high:     #F97316;
+  --color-risk-medium:   #EAB308;
+  --color-risk-low:      #22C55E;
+
+  /* ── Typography ─────────────────────────────────────── */
+  /* --font-inter and --font-jetbrains are set as CSS vars on <html> by next/font */
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, "Courier New", monospace;
+
+  /* ── Animations ─────────────────────────────────────── */
+  /* cubic-bezier(0.16,1,0.3,1) ≈ power2.out from GSAP */
+  --animate-fade-up:  fadeUp  0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-slide-in: slideIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text-primary);
+}

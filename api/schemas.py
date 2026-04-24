@@ -68,3 +68,37 @@ class HealthCheck(BaseModel):
     status: str         # "ok" | "degraded"
     version: str
     checks: dict        # {"database": {...}, "model_file": {...}, "feature_schema": {...}}
+
+
+class AccountListItem(BaseModel):
+    """One row in the /accounts list — one account, highest-risk subscription."""
+    account_id: str
+    subscription_id: str
+    churn_probability: float
+    risk_level: str
+    scored_date: str
+
+
+class AccountsResponse(BaseModel):
+    """Response for GET /accounts.
+
+    tier_counts covers all accounts on the latest scored_date (not just top N).
+    previous_tier_counts does the same for the second-most-recent date; None
+    when only one scoring run exists (the delta KPI shows '--' in that case).
+    """
+    scored_date: str
+    total_accounts: int
+    tier_counts: dict[str, int]
+    previous_tier_counts: Optional[dict[str, int]] = None
+    accounts: list[AccountListItem]
+
+
+class HubSpotUrlResponse(BaseModel):
+    """Response for GET /accounts/{account_id}/hubspot_url.
+
+    url is populated when the account has been synced to HubSpot and
+    HUBSPOT_PORTAL_ID is configured. Otherwise url is None and reason
+    explains why, so the dashboard can show a helpful disabled state.
+    """
+    url: Optional[str] = None
+    reason: Optional[str] = None

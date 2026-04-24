@@ -3,12 +3,21 @@ main.py
 -------
 FastAPI service for the churn prediction system.
 
-Three endpoints:
+Endpoints:
 
     GET /health
         Real dependency check: DB connectivity, model file, feature schema.
         Returns {"status": "ok"|"degraded", "checks": {...}, "version": "..."}.
         The dashboard pings this on startup; Airflow can use it as a sensor.
+
+    GET /accounts
+        Top N accounts by churn risk on the latest scoring date. One row per
+        account (deduped). Powers the dashboard KPI strip and accounts table.
+
+    GET /accounts/{account_id}/hubspot_url
+        Reads hubspot_company_id from the local hubspot_account_map table and
+        returns a fully-formed HubSpot Company record URL. No live HubSpot API
+        call — populated by scripts/sync_to_hubspot.py.
 
     GET /score/{account_id}
         Latest churn score from the DB. Fast — no model inference at request time.
@@ -28,14 +37,22 @@ Swagger UI: http://127.0.0.1:8000/docs
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
 # Make src/ importable when uvicorn runs from the project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
+
+# Load .env for local dev. On Render, env vars are injected directly so
+# .env won't exist — guard prevents a UnicodeDecodeError on the absent file.
+if Path(".env").exists():
+    load_dotenv(encoding="utf-16")
 
 import src.data.db as db
 from src.data.db import get_engine
@@ -46,6 +63,9 @@ from api.schemas import (
     ScoreResponse,
     ExplainResponse,
     HealthCheck,
+    AccountListItem,
+    AccountsResponse,
+    HubSpotUrlResponse,
 )
 
 
@@ -55,6 +75,15 @@ app = FastAPI(
     title="Churn Prediction API",
     description="Score and explain churn risk for customer accounts.",
     version=API_VERSION,
+)
+
+# Allow all origins for now — tighten to the Vercel domain after deployment.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 
 
@@ -129,6 +158,147 @@ def health():
 
 
 # ---------------------------------------------------------------------------
+# Accounts list (used by the dashboard KPI strip + table)
+# ---------------------------------------------------------------------------
+
+@app.get("/accounts", response_model=AccountsResponse, tags=["predictions"])
+def get_accounts(limit: int = Query(default=50, ge=1, le=500)):
+    """Return top N accounts by churn risk on the most recent scoring date.
+
+    One row per account (deduped with ROW_NUMBER — same logic as the HubSpot
+    sync). tier_counts and previous_tier_counts cover all accounts (not just
+    the top N) so the dashboard KPI strip doesn't under-count.
+
+    previous_tier_counts comes from the second-most-recent scored_date and
+    powers the 'Critical tier change' delta KPI. None when only one scoring
+    run exists.
+    """
+    engine = get_engine()
+
+    with engine.connect() as conn:
+        # The two most-recent distinct scoring dates
+        dates = conn.execute(text("""
+            SELECT DISTINCT scored_date FROM churn_predictions
+            ORDER BY scored_date DESC LIMIT 2
+        """)).fetchall()
+
+        if not dates:
+            raise HTTPException(status_code=404, detail="No predictions found in DB.")
+
+        latest_date = dates[0].scored_date
+        prev_date = dates[1].scored_date if len(dates) > 1 else None
+
+        # Top-N accounts: one row per account, highest-risk subscription wins,
+        # subscription_id as tiebreaker so results are deterministic.
+        rows = conn.execute(text("""
+            WITH ranked AS (
+                SELECT account_id, subscription_id, churn_probability, risk_level, scored_date,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY account_id
+                           ORDER BY churn_probability DESC, subscription_id ASC
+                       ) AS rn
+                FROM churn_predictions
+                WHERE scored_date = :latest_date
+            )
+            SELECT account_id, subscription_id, churn_probability, risk_level, scored_date
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY churn_probability DESC
+            LIMIT :limit
+        """), {"latest_date": latest_date, "limit": limit}).fetchall()
+
+        # Total distinct account count on the latest date (may exceed limit)
+        total = conn.execute(text("""
+            SELECT COUNT(DISTINCT account_id) FROM churn_predictions
+            WHERE scored_date = :latest_date
+        """), {"latest_date": latest_date}).scalar() or 0
+
+        # Current tier distribution (all accounts, not just top N)
+        tier_rows = conn.execute(text("""
+            WITH ranked AS (
+                SELECT risk_level,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY account_id ORDER BY churn_probability DESC
+                       ) AS rn
+                FROM churn_predictions WHERE scored_date = :latest_date
+            )
+            SELECT risk_level, COUNT(*) AS cnt FROM ranked WHERE rn = 1 GROUP BY risk_level
+        """), {"latest_date": latest_date}).fetchall()
+        tier_counts = {r.risk_level: r.cnt for r in tier_rows}
+
+        # Previous tier distribution for the delta KPI
+        previous_tier_counts = None
+        if prev_date:
+            prev_rows = conn.execute(text("""
+                WITH ranked AS (
+                    SELECT risk_level,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY account_id ORDER BY churn_probability DESC
+                           ) AS rn
+                    FROM churn_predictions WHERE scored_date = :prev_date
+                )
+                SELECT risk_level, COUNT(*) AS cnt FROM ranked WHERE rn = 1 GROUP BY risk_level
+            """), {"prev_date": prev_date}).fetchall()
+            previous_tier_counts = {r.risk_level: r.cnt for r in prev_rows}
+
+    accounts = [
+        AccountListItem(
+            account_id=row.account_id,
+            subscription_id=row.subscription_id,
+            churn_probability=round(float(row.churn_probability), 4),
+            risk_level=row.risk_level,
+            scored_date=row.scored_date,
+        )
+        for row in rows
+    ]
+
+    return AccountsResponse(
+        scored_date=latest_date,
+        total_accounts=int(total),
+        tier_counts=tier_counts,
+        previous_tier_counts=previous_tier_counts,
+        accounts=accounts,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HubSpot URL lookup
+# ---------------------------------------------------------------------------
+
+@app.get("/accounts/{account_id}/hubspot_url", response_model=HubSpotUrlResponse, tags=["predictions"])
+def get_hubspot_url(account_id: str):
+    """Return the HubSpot Company record URL for an account.
+
+    Reads from hubspot_account_map — populated by scripts/sync_to_hubspot.py.
+    No live HubSpot API call is made at request time.
+
+    Returns url=None with a human-readable reason when:
+      - HUBSPOT_PORTAL_ID env var is not set
+      - the account hasn't been synced yet
+      - the table doesn't exist (sync has never run)
+    """
+    portal_id = os.getenv("HUBSPOT_PORTAL_ID")
+    if not portal_id:
+        return HubSpotUrlResponse(url=None, reason="HUBSPOT_PORTAL_ID not configured")
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        try:
+            row = conn.execute(
+                text("SELECT hubspot_company_id FROM hubspot_account_map WHERE account_id = :aid"),
+                {"aid": account_id},
+            ).fetchone()
+        except Exception:
+            return HubSpotUrlResponse(url=None, reason="Not yet synced — run sync_to_hubspot.py first")
+
+    if not row:
+        return HubSpotUrlResponse(url=None, reason="Not yet synced to HubSpot — run sync_to_hubspot.py first")
+
+    url = f"https://app.hubspot.com/contacts/{portal_id}/record/0-2/{row.hubspot_company_id}"
+    return HubSpotUrlResponse(url=url)
+
+
+# ---------------------------------------------------------------------------
 # Score
 # ---------------------------------------------------------------------------
 
@@ -146,9 +316,6 @@ def get_score(account_id: str):
     engine = get_engine()
 
     with engine.connect() as conn:
-        # Get all subscriptions for this account on their most recent scored_date.
-        # Subquery finds the latest date; outer query fetches all subscriptions on that day.
-        # Sorted by churn_probability DESC so row 0 is always the highest-risk subscription.
         rows = conn.execute(
             text("""
                 SELECT subscription_id, account_id, churn_probability, risk_level,
@@ -172,7 +339,6 @@ def get_score(account_id: str):
                    "Verify the account ID or run the nightly scorer first.",
         )
 
-    # Row 0 = highest-risk subscription (drives the account-level summary)
     top = rows[0]
 
     return ScoreResponse(
@@ -188,7 +354,6 @@ def get_score(account_id: str):
                 risk_level=row.risk_level,
                 scored_at=row.scored_at,
                 scored_date=row.scored_date,
-                # top_factors is not included in /score — use /explain for that
                 top_factors=None,
             )
             for row in rows
@@ -245,19 +410,13 @@ def get_explain(account_id: str):
 
     top = rows[0]
 
-    # --- Determine top_factors for the highest-risk subscription ---
     if top.top_factors:
-        # Fast path: precomputed factors already in the DB
         top_factors_raw = json.loads(top.top_factors)
         explanation_source = "precomputed"
     else:
-        # Fallback: run SHAP on-demand
         top_factors_raw = _compute_shap_on_demand(account_id, top.subscription_id)
         explanation_source = "on_demand"
 
-    # Parse every subscription's top_factors for the subscriptions array.
-    # Subscriptions without precomputed factors get None (on-demand is only
-    # triggered for the highest-risk subscription above).
     def _parse_factors(raw: str | None) -> list[FactorItem] | None:
         if not raw:
             return None
@@ -296,8 +455,6 @@ def _compute_shap_on_demand(account_id: str, subscription_id: str) -> list[dict]
     Slicing to one account first would give wrong tenure_days for active
     customers whose end_date is NaN.
     """
-    # Local imports keep the module-level namespace clean and make it obvious
-    # that this is the slow, CSV-loading path.
     from src.data.load_data import load_subscriptions, load_usage, load_tickets
     from src.features.build_features import build_features
     from src.models.explain_model import compute_top_factors
@@ -308,7 +465,6 @@ def _compute_shap_on_demand(account_id: str, subscription_id: str) -> list[dict]
 
     X_encoded, meta = build_features(subs, usage, tickets)
 
-    # Filter to just this account's rows for SHAP
     mask = meta["account_id"] == account_id
     X_account = X_encoded[mask]
     meta_account = meta[mask]
@@ -322,7 +478,6 @@ def _compute_shap_on_demand(account_id: str, subscription_id: str) -> list[dict]
 
     top_factors_map = compute_top_factors(X_account, meta_account)
 
-    # Return factors for the specific subscription_id we need
     factors_json = top_factors_map.get(str(subscription_id))
     if factors_json is None:
         raise HTTPException(
